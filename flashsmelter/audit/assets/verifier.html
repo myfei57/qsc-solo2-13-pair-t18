@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlashSmelter 离线核验</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; background: #f6f7f9; color: #1d2430; }
+  @media (prefers-color-scheme: dark) { body { background: #14171c; color: #e6e9ee; } .card { background: #1d2128 !important; } }
+  .card { max-width: 900px; margin: 0 auto 16px; background: #fff; border-radius: 10px; padding: 20px 24px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #6b7280; font-size: 13px; margin-bottom: 16px; }
+  .drop { border: 2px dashed #9aa4b2; border-radius: 10px; padding: 28px; text-align: center; cursor: pointer; }
+  .drop.hover { border-color: #2563eb; background: rgba(37,99,235,.06); }
+  code, .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .ok { color: #15803d; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #b45309; font-weight: 700; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td, th { border-bottom: 1px solid rgba(128,128,128,.25); padding: 6px 8px; text-align: left; vertical-align: top; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 7px; font-family: ui-monospace, Consolas, monospace; }
+  button { padding: 7px 14px; border-radius: 6px; border: 1px solid #9aa4b2; background: transparent; color: inherit; cursor: pointer; }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  .hidden { display: none; }
+  ul.fail { color: #dc2626; } ul.warnlist { color: #b45309; }
+  .pill { display:inline-block; padding:1px 8px; border-radius: 999px; font-size:12px; }
+  .pill.ok2 { background:#dcfce7; color:#15803d; } .pill.bad2 { background:#fee2e2; color:#b91c1c; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>FlashSmelter 离线核验</h1>
+  <div class="sub">全程在本机浏览器内完成，不联网、不上传任何文件。支持整包目录或 .zip。</div>
+
+  <div id="crypto-warning" class="hidden" style="color:#dc2626;margin-bottom:12px">
+    当前浏览器不支持 Web Crypto 的 Ed25519（需要 Chrome/Edge 113+、Firefox 130+ 或 Safari 17+）。
+    哈希链与 Merkle 根仍会复算，但签名验不了——请换浏览器，或用包内 <code>verifier.py</code>。
+  </div>
+
+  <label class="drop" id="drop">
+    <input type="file" id="picker" class="hidden" webkitdirectory directory multiple>
+    <input type="file" id="zipicker" class="hidden" accept=".zip">
+    <div>把核验包<strong>整个目录拖到这里</strong>，或</div>
+    <div style="margin-top:10px">
+      <button type="button" id="pick-dir">选择目录</button>
+      <button type="button" id="pick-zip">选择 .zip 文件</button>
+    </div>
+  </label>
+</div>
+
+<div class="card hidden" id="keycard">
+  <strong>信任公钥</strong>
+  <div class="sub">首次使用：把产线安全分发的 <code>public.pub</code> 内容粘进来（或点选文件），指纹应与纸质交接单一致。留空则仅信任包内公钥（有整包伪造风险，会告警）。</div>
+  <input type="text" id="trusted-key" placeholder="公钥 hex，或 public.pub 文件全部内容（支持 JSON 封装）">
+  <div style="margin-top:8px">
+    <button type="button" id="load-key">选择 public.pub</button>
+    <input type="file" id="keyfile" class="hidden" accept=".pub">
+    <span id="key-fp" class="mono"></span>
+  </div>
+</div>
+
+<div class="card hidden" id="result"></div>
+
+<script>
+"use strict";
+const GENESIS = "0".repeat(64);
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+function sha256Hex(buf) {
+  return crypto.subtle.digest("SHA-256", buf).then(b => buf2hex(b));
+}
+function buf2hex(buf) {
+  return [...new Uint8Array(buf)].map(x => x.toString(16).padStart(2, "0")).join("");
+}
+function hex2buf(hex) {
+  const clean = hex.replace(/\s+/g, "");
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  return out;
+}
+async function chainHash(prevHex, lineText) {
+  const data = new Uint8Array(32 + 1 + lineText.length);
+  data.set(hex2buf(prevHex), 0);
+  data[32] = 0;
+  data.set(enc.encode(lineText), 33);
+  return sha256Hex(data.buffer);
+}
+async function eventLeaf(rowHashHex) {
+  const prefix = new Uint8Array([70,83,49,1,101,118,101,110,116,0]); // FS1\x01event\x00
+  const data = new Uint8Array(prefix.length + 32);
+  data.set(prefix, 0); data.set(hex2buf(rowHashHex), prefix.length);
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", data.buffer));
+}
+async function stateLineLeaf(key, lineText) {
+  // 对 state.jsonl 整行原始字节取叶：浏览器按字节透传，不重新规范化数字。
+  const prefix = new Uint8Array([70,83,49,1,115,116,97,116,101,0]); // FS1\x01state\x00
+  const kb = enc.encode(key), lb = enc.encode(lineText);
+  const data = new Uint8Array(prefix.length + kb.length + 1 + lb.length);
+  let o = 0;
+  data.set(prefix, o); o += prefix.length;
+  data.set(kb, o); o += kb.length;
+  data[o++] = 0;
+  data.set(lb, o);
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", data.buffer));
+}
+async function merkleRoot(leaves) {
+  if (!leaves.length) return GENESIS;
+  let level = leaves.slice();
+  const tag = new Uint8Array([70,83,49,2,110,111,100,101,0,0]); // FS1\x02node\x00\x00
+  while (level.length > 1) {
+    if (level.length % 2) level.push(level[level.length - 1]);
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const data = new Uint8Array(tag.length + level[i].length + level[i + 1].length);
+      let o = 0;
+      data.set(tag, 0); o += tag.length;
+      data.set(level[i], o); o += level[i].length;
+      data.set(level[i + 1], o);
+      next.push(new Uint8Array(await crypto.subtle.digest("SHA-256", data.buffer)));
+    }
+    level = next;
+  }
+  return buf2hex(level[0].buffer);
+}
+function parsePubKey(text) {
+  let hex = text.trim();
+  if (hex.startsWith("{")) {
+    const parsed = JSON.parse(hex);
+    hex = String(parsed.public_key || "");
+  }
+  hex = hex.replace(/[^0-9a-fA-F]/g, "");
+  if (hex.length !== 64) throw new Error("公钥必须是 32 字节（64 个 hex 字符）");
+  return hex2buf(hex);
+}
+function compressRuns(seqs) {
+  if (!seqs.length) return "";
+  const runs = []; let s = seqs[0], p = seqs[0];
+  const flush = () => runs.push(s === p ? String(s) : s + "-" + p);
+  for (const v of seqs.slice(1)) {
+    if (v === p + 1) { p = v; continue; }
+    flush(); s = p = v;
+  }
+  flush();
+  return runs.join(", ");
+}
+
+let files = new Map(); // name -> Uint8Array
+
+async function verify() {
+  const result = document.getElementById("result");
+  result.classList.remove("hidden");
+  const failures = [], warnings = [];
+  const get = name => files.get(name);
+  const text = name => { const b = get(name); if (!b) throw new Error("缺少文件 " + name); return dec.decode(b); };
+
+  let manifest;
+  try { manifest = JSON.parse(text("manifest.json")); }
+  catch (e) { result.innerHTML = '<p class="bad">无法读取清单：' + e + "</p>"; return; }
+  const manifestBytes = get("manifest.json");
+
+  let embedded = null;
+  try { embedded = parsePubKey(text("public.pub")); }
+  catch (e) { failures.push("包内公钥不可读：" + e.message); }
+
+  let trusted = null;
+  const trustedText = document.getElementById("trusted-key").value.trim();
+  if (trustedText) {
+    try { trusted = parsePubKey(trustedText); } catch (e) { failures.push("信任公钥格式不正确：" + e.message); }
+  }
+  const pub = trusted || embedded;
+  if (trusted && embedded && buf2hex(trusted.buffer) !== buf2hex(embedded.buffer))
+    failures.push("包内公钥与预置信任公钥不一致——来源不可信");
+  if (!trusted && embedded) warnings.push("未预置信任公钥，仅用包内公钥验签；首次使用必须线下核对指纹");
+
+  // 签名
+  let sigOk = false, edSupported = true;
+  try {
+    const sig = hex2buf(text("manifest.sig"));
+    const key = await crypto.subtle.importKey("raw", pub, { name: "Ed25519" }, false, ["verify"]);
+    sigOk = await crypto.subtle.verify("Ed25519", key, sig, manifestBytes);
+    if (!sigOk) failures.push("清单签名校验失败——清单可能被伪造或篡改");
+  } catch (e) {
+    if (e.name === "NotSupportedError") { edSupported = false; warnings.push("本浏览器不支持 Ed25519，签名未校验"); }
+    else failures.push("签名校验出错：" + e.message);
+  }
+
+  const ev = manifest.events || {}, st = manifest.state || {}, rng = manifest.range || {}, pred = manifest.predecessor || {};
+  for (const [label, name, want] of [["events","events.jsonl", ev.sha256_file],
+                                     ["chain","chain.jsonl", ev.sha256_chain_file],
+                                     ["state","state.jsonl", st.count ? st.sha256_file : null]]) {
+    const b = get(name);
+    if (!b) { if (want) failures.push("缺少文件 " + name); continue; }
+    if (want && (await sha256Hex(b.buffer)) !== want) failures.push(name + " 文件哈希与清单不一致");
+  }
+
+  const eventLines = text("events.jsonl").split(/\r?\n/).filter(Boolean);
+  const chainLines = text("chain.jsonl").split(/\r?\n/).filter(Boolean);
+  const rows = eventLines.map(l => ({ seq: JSON.parse(l).seq, line: l }));
+  const anchors = new Map(chainLines.map(l => { const a = JSON.parse(l); return [a.seq, a]; }));
+  if (rows.length !== ev.count) failures.push("事件条数不一致：文件 " + rows.length + "，清单 " + ev.count);
+  if (chainLines.length !== rows.length) failures.push("chain.jsonl 与 events.jsonl 条数不一致");
+
+  const missing = [], dups = []; const seen = new Set();
+  let prevSeq = pred.seq || ((rng.first_seq || 1) - 1);
+  for (const r of rows) {
+    if (seen.has(r.seq)) dups.push(r.seq);
+    seen.add(r.seq);
+    if (r.seq !== prevSeq + 1) for (let s = prevSeq + 1; s < r.seq; s++) missing.push(s);
+    prevSeq = r.seq;
+  }
+  if (dups.length) failures.push("重复序号：" + dups.slice(0, 20).join(","));
+  if (missing.length) failures.push("缺失 " + missing.length + " 个序号：" + compressRuns(missing));
+
+  let previous = pred.chain_hash || GENESIS;
+  const leaves = []; const tampered = [];
+  for (const r of rows) {
+    const cur = await chainHash(previous, r.line);
+    leaves.push(await eventLeaf(cur));
+    const a = anchors.get(r.seq) || {};
+    if (a.prev_hash !== previous || a.chain_hash !== cur) tampered.push(r.seq);
+    previous = cur;
+  }
+  if (ev.chain_tip && previous !== ev.chain_tip)
+    failures.push("事件哈希链与清单链尖不一致；首个异常序号：" + (tampered[0] ?? rng.first_seq));
+  if (ev.merkle_root && (await merkleRoot(leaves)) !== ev.merkle_root)
+    failures.push("事件 Merkle 根与清单不一致——事件段被改动或替换");
+
+  const stateLeaves = []; let stateCount = 0;
+  const stateBlob = get("state.jsonl");
+  if (stateBlob && st.count) {
+    for (const line of dec.decode(stateBlob).split(/\r?\n/).filter(Boolean)) {
+      stateCount++;
+      try {
+        const parsed = JSON.parse(line);
+        stateLeaves.push(await stateLineLeaf(String(parsed.key), line));
+      } catch (e) { failures.push("state.jsonl 第 " + stateCount + " 行不合法：" + e.message); }
+    }
+    if (stateCount !== st.count) failures.push("状态条数不一致：文件 " + stateCount + "，清单 " + st.count);
+    if ((await merkleRoot(stateLeaves)) !== st.merkle_root)
+      failures.push("状态 Merkle 根与清单不一致——状态快照被改动或替换");
+  }
+  if (!(manifest.self_check && manifest.self_check.ok))
+    warnings.push("导出方申报：导出时现网自校验已有问题 " + JSON.stringify((manifest.self_check||{}).problems || []));
+
+  const ok = !failures.length;
+  const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  result.innerHTML =
+    '<p style="font-size:17px">核验结论：<span class="' + (ok ? "ok" : "bad") + '">' + (ok ? "通过 ✅ 导出当时的数据未被改动" : "未通过 ❌ 证据已被破坏或来源不可信") + "</span></p>" +
+    '<table>' +
+    "<tr><th>签名</th><td>" + (sigOk ? '<span class="pill ok2">有效</span>' : edSupported ? '<span class="pill bad2">无效</span>' : '<span class="pill">浏览器不支持，未校验</span>') +
+      (trusted ? "（预置信任公钥）" : "（包内公钥，需线下核对）") + "</td></tr>" +
+    "<tr><th>签名指纹</th><td class='mono'>" + esc(manifest.signer_fingerprint || "") + "</td></tr>" +
+    "<tr><th>密钥标识</th><td>" + esc(manifest.key_id || "") + "</td></tr>" +
+    "<tr><th>命名空间</th><td>" + esc(manifest.namespace || "") + "</td></tr>" +
+    "<tr><th>导出时间 UTC</th><td class='mono'>" + esc(manifest.created_at || "") + "</td></tr>" +
+    "<tr><th>事件范围</th><td>" + (rng.first_seq ?? "-") + "–" + (rng.last_seq ?? "-") + "，共 " + rows.length + " 条；前置锚点 seq=" + (pred.seq ?? "无") + "</td></tr>" +
+    "<tr><th>链状态</th><td>" + (tampered.length ? '首个被改动序号 <span class="bad">#' + tampered[0] + "</span>" : '<span class="ok">逐行链接完整</span>') +
+      (missing.length ? "；缺失序号 " + esc(compressRuns(missing)) : "") + "</td></tr>" +
+    "<tr><th>状态快照</th><td>" + stateCount + " 条，Merkle 根" + (failures.some(f => f.includes("状态 Merkle")) ? ' <span class="bad">不一致</span>' : ' <span class="ok">一致</span>') + "</td></tr>" +
+    "</table>" +
+    (warnings.length ? '<ul class="warnlist">' + warnings.map(w => "<li>⚠ " + esc(w) + "</li>").join("") + "</ul>" : "") +
+    (failures.length ? '<ul class="fail">' + failures.map(f => "<li>✗ " + esc(f) + "</li>").join("") + "</ul>" : "");
+}
+
+async function loadFileList(fileList) {
+  files = new Map();
+  for (const file of fileList) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    files.set(file.name, buf);
+  }
+  if (!files.has("manifest.json")) {
+    document.getElementById("result").classList.remove("hidden");
+    document.getElementById("result").innerHTML = '<p class="bad">所选内容里没有 manifest.json：请选择核验包的<strong>整个目录</strong>，不要只选里面的单个文件。</p>';
+    return;
+  }
+  document.getElementById("keycard").classList.remove("hidden");
+  await verify();
+}
+
+// ---- 极简 ZIP 解析（stored / deflate），覆盖本工具写出的包 ----
+async function unzip(bytes) {
+  const dv = new DataView(bytes.buffer);
+  let entries = [];
+  for (let i = 0; i + 4 <= bytes.length; ) {
+    const sig = dv.getUint32(i, true);
+    if (sig === 0x04034b50) {
+      const method = dv.getUint16(i + 8, true);
+      const compSize = dv.getUint32(i + 18, true);
+      const nameLen = dv.getUint16(i + 26, true);
+      const extraLen = dv.getUint16(i + 28, true);
+      const name = dec.decode(bytes.subarray(i + 30, i + 30 + nameLen));
+      const dataStart = i + 30 + nameLen + extraLen;
+      const raw = bytes.subarray(dataStart, dataStart + compSize);
+      // 本地头无数据描述符长度字段问题：本工具写的 zip 每条独立、无数据描述符。
+      i = dataStart + compSize;
+      entries.push({ name, method, raw });
+    } else if (sig === 0x02014b50) {
+      break;
+    } else {
+      i++;
+    }
+  }
+  const out = [];
+  for (const e of entries) {
+    if (e.name.endsWith("/")) continue;
+    let data = e.raw;
+    if (e.method === 8) data = await inflateRaw(e.raw);
+    out.push({ name: e.name, data });
+  }
+  return out;
+}
+async function loadZip(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const entries = await unzip(buf);
+  files = new Map(entries.map(e => [e.name.split("/").pop(), e.data]));
+  if (!files.has("manifest.json")) {
+    document.getElementById("result").classList.remove("hidden");
+    document.getElementById("result").innerHTML = '<p class="bad">zip 中没有 manifest.json，不是有效的核验包。</p>';
+    return;
+  }
+  document.getElementById("keycard").classList.remove("hidden");
+  await verify();
+}
+async function inflateRaw(compressed) {
+  if (typeof DecompressionStream === "undefined") throw new Error("浏览器不支持 DEFLATE 解压，请改用目录形态或 verifier.py");
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// ---- 事件绑定 ----
+const drop = document.getElementById("drop");
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("hover"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("hover"); }));
+drop.addEventListener("drop", async e => {
+  const dropped = [...e.dataTransfer.files];
+  if (dropped.length === 1 && dropped[0].name.endsWith(".zip")) {
+    await loadZip(dropped[0]);
+  } else if (dropped.length) {
+    await loadFileList(dropped);
+  }
+});
+document.getElementById("pick-dir").addEventListener("click", e => { e.preventDefault(); document.getElementById("picker").click(); });
+document.getElementById("pick-zip").addEventListener("click", e => { e.preventDefault(); document.getElementById("zipicker").click(); });
+document.getElementById("picker").addEventListener("change", e => loadFileList([...e.target.files]));
+document.getElementById("zipicker").addEventListener("change", e => e.target.files[0] && loadZip(e.target.files[0]));
+document.getElementById("load-key").addEventListener("click", () => document.getElementById("keyfile").click());
+document.getElementById("keyfile").addEventListener("change", async e => {
+  const t = await e.target.files[0].text();
+  document.getElementById("trusted-key").value = t.trim();
+  keyFp();
+});
+document.getElementById("trusted-key").addEventListener("input", () => { keyFp(); if (files.size) verify(); });
+async function keyFp() {
+  const el = document.getElementById("key-fp");
+  try {
+    const pub = parsePubKey(document.getElementById("trusted-key").value);
+    el.textContent = "指纹（SHA-256 前16位）：" + (await sha256Hex(pub.buffer)).slice(0, 16);
+  } catch { el.textContent = ""; }
+}
+(async () => {
+  try { await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]); }
+  catch { document.getElementById("crypto-warning").classList.remove("hidden"); }
+})();
+</script>
+</body>
+</html>

@@ -96,6 +96,44 @@ class CliTest(unittest.TestCase):
         self.assertEqual(1, unknown.returncode)
         self.assertEqual("validation-error", self._json(unknown)["error"])
 
+    def test_offline_pack_cli_lifecycle(self) -> None:
+        from pathlib import Path
+
+        keys_dir = self.root / "keys"
+        pack_dir = self.root / "visit"
+
+        created = run_cli("keychain-init", "--keys-dir", str(keys_dir), root=self.root)
+        self.assertEqual(0, created.returncode)
+        self.assertEqual(16, len(self._json(created)["fingerprint"]))
+
+        # 没有流水时导出应失败（避免空包当证据）
+        empty = run_cli("pack-export", str(pack_dir), "--keys-dir", str(keys_dir), root=self.root)
+        self.assertNotEqual(0, empty.returncode)
+
+        run_cli(
+            "call", "furnace.start",
+            "--params-json", json.dumps({
+                "drum_level": 0.6, "fuel_pressure_kpa": 200.0, "air_flow_nm3h": 5200.0,
+                "oxygen_baseline": 0.62, "oxygen_baseline_source": "analyzer-a",
+                "oxygen_target": 0.62, "oxygen_flow_nm3h": 9000.0,
+            }),
+            root=self.root,
+        )
+
+        exported = run_cli("pack-export", str(pack_dir), "--keys-dir", str(keys_dir), root=self.root)
+        self.assertEqual(0, exported.returncode, exported.stderr)
+        self.assertGreaterEqual(self._json(exported)["event_count"], 1)
+        self.assertTrue((pack_dir / "verifier.py").exists())
+
+        pubkey = keys_dir / "line1.pub"
+        verified = run_cli("pack-verify", str(pack_dir), "--pubkey", str(pubkey), root=self.root)
+        self.assertEqual(0, verified.returncode, verified.stdout)
+        self.assertTrue(self._json(verified)["ok"])
+
+        reconciled = run_cli("pack-reconcile", str(pack_dir), "--pubkey", str(pubkey), root=self.root)
+        self.assertEqual(0, reconciled.returncode, reconciled.stdout)
+        self.assertEqual("ok", self._json(reconciled)["verdict"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -71,6 +71,15 @@ class JournalEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class RawJournalEntry:
+    """带落盘原始字节的流水行，供离线核验包复算哈希链。"""
+
+    seq: int
+    raw_line: str
+    payload: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class IntegrityReport:
     records_checked: int
     journals_checked: int
@@ -274,6 +283,76 @@ class DurableStore:
             entries = entries[-limit:]
         return entries
 
+    def read_stream_raw(
+        self,
+        stream: str,
+        *,
+        since_seq: int = 0,
+        max_seq: int | None = None,
+        verify: bool = False,
+    ) -> list[RawJournalEntry]:
+        """按原始字节读取流水行（含序号过滤），核验包导出专用。
+
+        与 :meth:`read_stream` 不同，这里返回**逐字节的原始行文本**并默认不做
+        自校验和校验：核验链需要原始字节，而且数据是否被动过本就该由哈希链与
+        签名判定。序号不连续的文件会被如实读出（每条都返回），缺段由链锚点
+        与序号连续性检查发现。
+        """
+
+        segments = validate_key(stream)
+        path = self.journal_root.joinpath(*segments).with_suffix(".jsonl")
+        if not path.exists():
+            return []
+        rows: list[RawJournalEntry] = []
+        with self._lock, path.open("rb") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                text = raw.decode("utf-8").strip()
+                if not text:
+                    continue
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise IntegrityError(
+                        "流水行无法解析，文件已被破坏",
+                        details={"stream": stream, "line": line_number},
+                    ) from exc
+                seq = int(parsed.get("seq", 0))
+                if seq <= since_seq:
+                    continue
+                if max_seq is not None and seq > max_seq:
+                    continue
+                payload = parsed.get("payload", {})
+                if verify:
+                    written_at = str(parsed.get("written_at", ""))
+                    if checksum_of(seq, written_at, payload) != parsed.get("checksum"):
+                        raise IntegrityError(
+                            "流水行校验和不匹配",
+                            details={"stream": stream, "line": line_number, "seq": seq},
+                        )
+                rows.append(RawJournalEntry(seq=seq, raw_line=text, payload=payload))
+        return rows
+
+    def predecessor_raw(self, stream: str, seq: int) -> RawJournalEntry | None:
+        """返回序号严格小于 ``seq`` 的最后一条原始行，用作导出段的前置锚点。"""
+
+        if seq <= 1:
+            return None
+        rows = self.read_stream_raw(stream, since_seq=0, max_seq=seq - 1)
+        return rows[-1] if rows else None
+
+    def read_record_raw(self, key: str) -> tuple[str, bytes] | None:
+        """返回 ``(键, 落盘信封原始字节)``；不存在返回 None。"""
+
+        segments = validate_key(key)
+        path = self.data_root.joinpath(*segments).with_suffix(".json")
+        if not path.exists():
+            return None
+        return key, path.read_bytes()
+
+    def stream_path(self, stream: str) -> Path:
+        segments = validate_key(stream)
+        return self.journal_root.joinpath(*segments).with_suffix(".jsonl")
+
     def stream_length(self, stream: str) -> int:
         segments = validate_key(stream)
         path = self.journal_root.joinpath(*segments).with_suffix(".jsonl")
@@ -411,4 +490,4 @@ class DurableStore:
         finally:
             os.close(descriptor)
 
-__all__ = ["DurableStore", "Record", "JournalEntry", "IntegrityReport"]
+__all__ = ["DurableStore", "Record", "JournalEntry", "RawJournalEntry", "IntegrityReport"]

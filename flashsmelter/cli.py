@@ -151,6 +151,67 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report.get("ok") else 2
 
 
+def _cmd_keychain_init(args: argparse.Namespace) -> int:
+    from .audit.keychain import fingerprint, init_keychain
+
+    identity = init_keychain(args.keys_dir, key_id=args.key_id)
+    public = identity.public()
+    _print(
+        {
+            "key_id": identity.key_id,
+            "secret_path": str(identity.secret_path),
+            "public_path": str(identity.public_path),
+            "fingerprint": fingerprint(public),
+            "warning": "私钥只允许留在线上导出主机，权限已设为 600；车间离线机只分发 .pub",
+        }
+    )
+    return 0
+
+
+def _cmd_pack_export(args: argparse.Namespace) -> int:
+    from .audit.keychain import load_identity
+    from .audit.offline import export_pack
+
+    application = Application(_build_settings(args))
+    identity = load_identity(args.keys_dir, key_id=args.key_id)
+    result = export_pack(
+        application.store,
+        application.namespace,
+        application.clock,
+        identity,
+        args.output,
+        since_seq=args.since,
+        state_prefix=args.state_prefix or "",
+        allow_inconsistent=args.allow_inconsistent,
+        zip_pack=args.zip,
+    )
+    _print(result.to_dict())
+    return 0
+
+
+def _cmd_pack_verify(args: argparse.Namespace) -> int:
+    from .audit.keychain import load_public_key
+    from .audit.offline import PackReader, verify_pack
+
+    trusted = load_public_key(args.pubkey) if args.pubkey else None
+    with PackReader(args.pack) as reader:
+        report = verify_pack(reader, trusted_pubkey=trusted)
+    _print(report)
+    return 0 if report.get("ok") else 2
+
+
+def _cmd_pack_reconcile(args: argparse.Namespace) -> int:
+    from .audit.keychain import load_public_key
+    from .audit.offline import PackReader, reconcile_pack
+
+    application = Application(_build_settings(args))
+    trusted = load_public_key(args.pubkey) if args.pubkey else None
+    with PackReader(args.pack) as reader:
+        report = reconcile_pack(reader, application.store, application.namespace, trusted_pubkey=trusted)
+    _print(report)
+    return 0 if report.get("ok") else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flashsmelter",
@@ -194,6 +255,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)
+
+    keychain = subparsers.add_parser("keychain-init", help="生成离线核验签名密钥（线上主机执行一次）")
+    keychain.add_argument("--keys-dir", default="var/keys", help="密钥目录（默认 var/keys）")
+    keychain.add_argument("--key-id", default="line1", help="密钥标识")
+    keychain.set_defaults(func=_cmd_keychain_init)
+
+    pack_export = subparsers.add_parser("pack-export", help="导出离线核验包（当前状态 + 一段流水，签名）")
+    pack_export.add_argument("output", help="输出目录；加 --zip 时为 .zip 文件路径")
+    pack_export.add_argument("--keys-dir", default="var/keys", help="签名密钥目录")
+    pack_export.add_argument("--key-id", default="line1")
+    pack_export.add_argument("--since", type=int, default=0, help="只导出序号大于该值的流水")
+    pack_export.add_argument("--state-prefix", default="", help="状态快照只导出该前缀（命名空间内）")
+    pack_export.add_argument("--allow-inconsistent", action="store_true", help="现网自校验失败时仍强制导出")
+    pack_export.add_argument("--zip", action="store_true", help="打成单个 .zip")
+    pack_export.set_defaults(func=_cmd_pack_export)
+
+    pack_verify = subparsers.add_parser("pack-verify", help="离线自证：校验核验包签名/哈希链/Merkle 根")
+    pack_verify.add_argument("pack", help="核验包目录或 .zip")
+    pack_verify.add_argument("--pubkey", help="预置信任公钥（.pub）；不给则用包内公钥并告警")
+    pack_verify.set_defaults(func=_cmd_pack_verify)
+
+    pack_reconcile = subparsers.add_parser("pack-reconcile", help="回线上逐条对账，指出改动/缺段/插入")
+    pack_reconcile.add_argument("pack", help="核验包目录或 .zip")
+    pack_reconcile.add_argument("--pubkey", help="预置信任公钥（.pub）")
+    pack_reconcile.set_defaults(func=_cmd_pack_reconcile)
 
     return parser
 

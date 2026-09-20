@@ -14,9 +14,8 @@ from ..ns import Namespace
 from ..runtime import Clock
 from ..store import DurableStore, JournalEntry
 
-AUDIT_STREAM = "audit/events"
-
-OUTCOMES = ("ok", "rejected", "failed")
+from .streams import AUDIT_STREAM, OUTCOMES
+from . import keychain, offline  # noqa: E402,F401  (子模块随包导出，便于 CLI 引用)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,4 +134,4 @@ class AuditLog:
         )
 
 
-__all__ = ["AuditLog", "AuditEvent", "AUDIT_STREAM", "OUTCOMES"]
+__all__ = ["AuditLog", "AuditEvent", "AUDIT_STREAM", "OUTCOMES", "offline", "keychain"]
