@@ -151,6 +151,71 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report.get("ok") else 2
 
 
+def _cmd_attest_keygen(args: argparse.Namespace) -> int:
+    from .attest import generate_keypair, save_keypair
+
+    pair = generate_keypair()
+    save_keypair(pair, Path(args.key), Path(args.public_key))
+    _print(
+        {
+            "generated": True,
+            "key_id": pair.key_id,
+            "private_key": args.key,
+            "public_key": args.public_key,
+            "notice": "私钥只留在线上服务器（建议进 HSM）；把公钥预置到车间核验端",
+        }
+    )
+    return 0
+
+
+def _cmd_attest_export(args: argparse.Namespace) -> int:
+    from .attest import export_bundle, load_private_key
+
+    application = Application(_build_settings(args))
+    private_pem = load_private_key(Path(args.key))
+    from .attest.crypto import KeyPair
+
+    public_path = Path(args.public_key) if args.public_key else Path(args.key).with_suffix(".pub")
+    pair = KeyPair(public_pem=public_path.read_bytes(), private_pem=private_pem)
+    result = export_bundle(
+        application.store,
+        args.bundle,
+        stream=args.stream,
+        seq_from=args.seq_from,
+        seq_to=args.seq_to,
+        namespace=application.namespace.prefix,
+        key_pair=pair,
+        clock=application.clock,
+    )
+    _print(result)
+    return 0
+
+
+def _cmd_attest_verify(args: argparse.Namespace) -> int:
+    from .attest import load_public_key, verify_bundle
+
+    pinned = load_public_key(Path(args.public_key)) if args.public_key else None
+    report = verify_bundle(args.bundle, pinned_public_pem=pinned)
+    payload = report.to_dict()
+    if pinned is None:
+        payload["warning"] = "未提供预置公钥，使用了包内公钥；正式核验应使用车间预置公钥"
+    _print(payload)
+    return 0 if report.ok else 3
+
+
+def _cmd_attest_reconcile(args: argparse.Namespace) -> int:
+    from .attest import load_public_key, reconcile_bundle
+
+    application = Application(_build_settings(args))
+    pinned = load_public_key(Path(args.public_key)) if args.public_key else None
+    report = reconcile_bundle(args.bundle, application.store, pinned_public_pem=pinned)
+    payload = report.to_dict()
+    if pinned is None:
+        payload["warning"] = "未提供预置公钥；建议用车间预置公钥验签后再对账"
+    _print(payload)
+    return 0 if report.ok else 3
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flashsmelter",
@@ -194,6 +259,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)
+
+    keygen = subparsers.add_parser("attest-keygen", help="生成离线核验包 Ed25519 签名密钥")
+    keygen.add_argument("--key", default="keys/attest-ed25519.pem", help="私钥输出路径")
+    keygen.add_argument("--public-key", default="keys/attest-ed25519.pub", help="公钥输出路径")
+    keygen.set_defaults(func=_cmd_attest_keygen)
+
+    export = subparsers.add_parser("attest-export", help="导出带签名的离线核验包")
+    export.add_argument("bundle", help="核验包输出目录（以 .zip 结尾则打成 zip）")
+    export.add_argument("--stream", default="audit/events", help="要导出的流水名")
+    export.add_argument("--from", dest="seq_from", type=int, default=1, help="流水起始序号")
+    export.add_argument("--to", dest="seq_to", type=int, default=None, help="流水结束序号（默认到链头）")
+    export.add_argument("--key", default="keys/attest-ed25519.pem", help="签名私钥路径")
+    export.add_argument("--public-key", default=None, help="公钥路径（默认取私钥同名 .pub）")
+    export.set_defaults(func=_cmd_attest_export)
+
+    attest_verify = subparsers.add_parser("attest-verify", help="离线核验（断网可用）：验签、验哈希链")
+    attest_verify.add_argument("bundle", help="核验包目录或 zip")
+    attest_verify.add_argument("--public-key", default=None, help="车间预置公钥（不传则用包内公钥并告警）")
+    attest_verify.set_defaults(func=_cmd_attest_verify)
+
+    reconcile = subparsers.add_parser("attest-reconcile", help="回联后逐条对账：指出被改/缺失/缺段")
+    reconcile.add_argument("bundle", help="核验包目录或 zip")
+    reconcile.add_argument("--public-key", default=None, help="车间预置公钥（强烈建议提供）")
+    reconcile.set_defaults(func=_cmd_attest_reconcile)
 
     return parser
 
